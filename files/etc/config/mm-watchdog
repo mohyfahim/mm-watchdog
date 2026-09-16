@@ -1,37 +1,32 @@
 config mm_watchdog 'main'
-        option enabled '1'
+	option enabled '1'
+	option interface 'wwan'
+	option modem 'auto'
 
-        option interface 'LTE'
+	option check_interval '5'
+	option ping_timeout '2'
+	list ping_target '1.1.1.1'
+	list ping_target '8.8.8.8'
 
-        option api_enabled '1'
-        option api_url 'your.api.url'
-        option api_name 'system'
-        option api_type 'mm-watch-dog'
+	option modemmanager_fail_limit '3'
+	option connected_fail_limit '3'
+	option registered_fail_limit '3'
 
-        option api_timeout '5'        
-        option check_interval '5'
+	option searching_recovery_after '180'
+	option searching_recovery_cooldown '600'
+	option temporary_state_timeout '120'
+	option enabled_state_timeout '60'
+	option action_grace '20'
 
-        option connected_fail_limit '3'
-        option registered_fail_limit '3'
+	option mm_restart_cooldown '120'
+	option radio_cycle_cooldown '120'
+	option modem_reset_cooldown '600'
 
-        option searching_recovery_after '180'
-        option searching_recovery_cooldown '600'
-
-        option modem_reset_cooldown '600'
-        option mm_restart_cooldown '120'
-
-        option temporary_state_timeout '120'
-        option enabled_state_timeout '60'
-
-        option action_grace '20'
-
-        option ping_timeout '2'
-        option ping_targets '8.8.8.8 1.1.1.1'
-
-        option report_recovery '1'
-        option report_errors '1'
-        option report_startup '1'
-        
-        option max_diag_bytes '8000'
-        option modem_log_lines '60'
-        option kernel_log_lines '40'
+	option webhook_enabled '0'
+	option webhook_url ''
+	option webhook_timeout '5'
+	option webhook_retry_interval '60'
+	option webhook_queue_limit '20'
+	option report_startup '1'
+	option report_recovery '1'
+	option report_errors '1'

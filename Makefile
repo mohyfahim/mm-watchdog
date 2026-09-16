@@ -4,7 +4,9 @@ PKG_NAME:=mm-watchdog
 PKG_VERSION:=1.0.0
 PKG_RELEASE:=1
 
-PKG_LICENSE:=Proprietary
+PKG_LICENSE:=GPL-2.0-or-later
+PKG_LICENSE_FILES:=LICENSE
+PKGARCH:=all
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -12,14 +14,14 @@ include $(INCLUDE_DIR)/package.mk
 define Package/mm-watchdog
   SECTION:=net
   CATEGORY:=Network
-  TITLE:=Podbox ModemManager watchdog
-  DEPENDS:=+modemmanager +uclient-fetch
+  TITLE:=Connectivity watchdog for ModemManager
+  DEPENDS:=+modemmanager +jshn +uclient-fetch +ca-bundle
 endef
 
 
 define Package/mm-watchdog/description
-  Production ModemManager watchdog with automatic cellular recovery
-  and remote diagnostic reporting.
+  Monitors cellular Internet connectivity through ModemManager and
+  performs staged, cooldown-aware recovery for mobile OpenWrt devices.
 endef
 
 
@@ -36,6 +38,14 @@ define Package/mm-watchdog/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/usr/sbin/modem-watchdog \
 		$(1)/usr/sbin/modem-watchdog
+
+	$(INSTALL_DIR) $(1)/usr/lib/mm-watchdog
+	$(INSTALL_DATA) ./files/usr/lib/mm-watchdog/config.sh \
+		$(1)/usr/lib/mm-watchdog/config.sh
+	$(INSTALL_DATA) ./files/usr/lib/mm-watchdog/webhook.sh \
+		$(1)/usr/lib/mm-watchdog/webhook.sh
+	$(INSTALL_DATA) ./files/usr/lib/mm-watchdog/watchdog.sh \
+		$(1)/usr/lib/mm-watchdog/watchdog.sh
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/etc/init.d/mm-watchdog \

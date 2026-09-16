@@ -1,0 +1,5 @@
+*.apk
+*.ipk
+*.swp
+*.tmp
+.DS_Store

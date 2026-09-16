@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Shell checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+
+      - name: Check shell syntax
+        run: |
+          sh -n \
+            files/usr/sbin/modem-watchdog \
+            files/usr/lib/mm-watchdog/*.sh \
+            files/etc/init.d/mm-watchdog \
+            tests/test.sh
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck -s sh -x \
+            files/usr/sbin/modem-watchdog \
+            files/usr/lib/mm-watchdog/*.sh \
+            files/etc/init.d/mm-watchdog \
+            tests/test.sh
+
+      - name: Run mocked tests
+        run: sh tests/test.sh
+
+  package:
+    name: OpenWrt ${{ matrix.release }} package
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        release:
+          - 24.10.8
+          - 25.12.5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install SDK tools
+        run: sudo apt-get update && sudo apt-get install --yes curl zstd
+
+      - name: Download x86_64 SDK
+        env:
+          OPENWRT_RELEASE: ${{ matrix.release }}
+        run: |
+          set -eu
+          base_url="https://downloads.openwrt.org/releases/${OPENWRT_RELEASE}/targets/x86/64"
+          sdk_file="$(curl --fail --silent --show-error --location "${base_url}/" |
+            sed -n 's/.*href="\(openwrt-sdk-[^"]*Linux-x86_64\.tar\.zst\)".*/\1/p' |
+            head -n 1)"
+          test -n "$sdk_file"
+          sdk_archive="${RUNNER_TEMP}/sdk.tar.zst"
+          curl --fail --show-error --location --output "$sdk_archive" "${base_url}/${sdk_file}"
+          sdk_dir="${RUNNER_TEMP}/openwrt-sdk"
+          mkdir "$sdk_dir"
+          tar --extract --zstd --file "$sdk_archive" --directory "$sdk_dir" --strip-components=1
+          printf 'SDK_DIR=%s\n' "$sdk_dir" >>"$GITHUB_ENV"
+
+      - name: Install package and feed metadata
+        run: |
+          mkdir "$SDK_DIR/package/mm-watchdog"
+          git archive HEAD | tar --extract --file=- --directory "$SDK_DIR/package/mm-watchdog"
+          cd "$SDK_DIR"
+          ./scripts/feeds update packages
+          ./scripts/feeds install modemmanager
+          make defconfig
+
+      - name: Build package
+        run: make -C "$SDK_DIR" package/mm-watchdog/compile V=s
