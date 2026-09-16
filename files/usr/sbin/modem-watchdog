@@ -1,0 +1,2060 @@
+#!/bin/sh
+
+#
+# Podbox ModemManager watchdog
+#
+# Recovery order:
+#
+#   1. ifdown/ifup
+#   2. restart ModemManager
+#   3. disable/enable modem radio
+#   4. modem reset
+#
+# Diagnostics are sent directly to:
+#
+#   https://api.podbox.plus/logs
+#
+# Expected API format:
+#
+# {
+#   "name": "system",
+#   "content": {
+#       ...
+#   },
+#   "type": "mm-watch-dog"
+# }
+#
+# Designed for OpenWrt / BusyBox ash.
+#
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+. /usr/share/ModemManager/modemmanager.common
+
+TAG="modem-watchdog"
+
+###############################################################################
+# Configuration
+###############################################################################
+
+load_watchdog_config() {
+	config_load mm-watchdog
+
+	config_get_bool ENABLED main enabled 1
+
+	config_get NETIF main interface "wwan"
+
+	config_get_bool API_ENABLED main api_enabled 1
+	config_get API_URL main api_url \
+		"https://api.podbox.plus/logs"
+
+	config_get API_NAME main api_name \
+		"system"
+
+	config_get API_TYPE main api_type \
+		"mm-watch-dog"
+
+	# config_get API_CONNECT_TIMEOUT main api_connect_timeout 2
+	# config_get API_MAX_TIME main api_max_time 5
+	config_get API_TIMEOUT main api_timeout 5
+
+	config_get CHECK_INTERVAL main check_interval 5
+
+	#
+	# 3 failures * 5 seconds = about 15 seconds.
+	#
+	config_get CONNECTED_FAIL_LIMIT \
+		main connected_fail_limit 3
+
+	config_get REGISTERED_FAIL_LIMIT \
+		main registered_fail_limit 3
+
+	#
+	# Searching is normal in low-coverage areas.
+	# Don't touch the modem aggressively while it searches.
+	#
+	config_get SEARCHING_RECOVERY_AFTER \
+		main searching_recovery_after 180
+
+	config_get SEARCHING_RECOVERY_COOLDOWN \
+		main searching_recovery_cooldown 600
+
+	#
+	# Do not repeatedly hard reset the modem.
+	#
+	config_get MODEM_RESET_COOLDOWN \
+		main modem_reset_cooldown 600
+
+	config_get MM_RESTART_COOLDOWN \
+		main mm_restart_cooldown 120
+
+	#
+	# Maximum time modem may remain in transitional states.
+	#
+	config_get TEMP_STATE_TIMEOUT \
+		main temporary_state_timeout 120
+
+	config_get ENABLED_STATE_TIMEOUT \
+		main enabled_state_timeout 60
+
+	#
+	# Wait after recovery operations before evaluating again.
+	#
+	config_get ACTION_GRACE \
+		main action_grace 20
+
+	config_get PING_TIMEOUT \
+		main ping_timeout 2
+
+	config_get PING_TARGETS \
+		main ping_targets "1.1.1.1 8.8.8.8"
+
+	config_get_bool REPORT_RECOVERY \
+		main report_recovery 1
+
+	config_get_bool REPORT_ERRORS \
+		main report_errors 1
+
+	config_get_bool REPORT_STARTUP \
+		main report_startup 1
+
+	#
+	# Maximum size of individual diagnostic fields.
+	#
+	config_get MAX_DIAG_BYTES \
+		main max_diag_bytes 8000
+
+	config_get MODEM_LOG_LINES \
+		main modem_log_lines 60
+
+	config_get KERNEL_LOG_LINES \
+		main kernel_log_lines 40
+}
+
+load_watchdog_config
+
+[ "$ENABLED" -eq 1 ] || exit 0
+
+###############################################################################
+# Runtime state
+###############################################################################
+
+bad_count=0
+mm_failure_count=0
+
+#
+# Recovery level:
+#
+#   0 = nothing attempted
+#   1 = soft reconnect attempted
+#   2 = ModemManager restart attempted
+#   3 = radio cycle attempted
+#   4 = modem reset attempted
+#
+recovery_level=0
+
+last_state=""
+state_since="$(date +%s)"
+
+last_mm_restart=0
+last_modem_reset=0
+last_search_recovery=0
+
+incident_id=""
+incident_started=0
+
+###############################################################################
+# Logging
+###############################################################################
+
+log() {
+	logger \
+		-p daemon.info \
+		-t "$TAG" \
+		"$*"
+}
+
+log_warning() {
+	logger \
+		-p daemon.warning \
+		-t "$TAG" \
+		"$*"
+}
+
+###############################################################################
+# Generic helpers
+###############################################################################
+
+now() {
+	date +%s
+}
+
+truncate_output() {
+	head -c "$MAX_DIAG_BYTES"
+}
+
+ensure_incident() {
+	[ -n "$incident_id" ] && return
+
+	incident_started="$(now)"
+	incident_id="${incident_started}-$$"
+
+	log "incident-start id=$incident_id"
+}
+
+clear_incident() {
+	incident_id=""
+	incident_started=0
+}
+
+set_recovery_level_min() {
+	local minimum="$1"
+
+	[ "$recovery_level" -ge "$minimum" ] ||
+		recovery_level="$minimum"
+}
+
+###############################################################################
+# Modem helpers
+###############################################################################
+
+get_modem_status() {
+	mmcli \
+		--timeout 10 \
+		--modem any \
+		--output-keyvalue \
+		2>/dev/null
+}
+
+get_bearer_path() {
+	local modem_status="$1"
+
+	[ -n "$modem_status" ] || return 1
+
+	modemmanager_get_field \
+		"$modem_status" \
+		'modem.generic.bearers.value\[1\]'
+}
+
+get_bearer_status() {
+	local bearer_path="$1"
+
+	[ -n "$bearer_path" ] || return 1
+
+	mmcli \
+		--timeout 10 \
+		--bearer "$bearer_path" \
+		--output-keyvalue \
+		2>/dev/null
+}
+
+get_bearer_iface() {
+	local bearer_status="$1"
+
+	[ -n "$bearer_status" ] || return 1
+
+	modemmanager_get_field \
+		"$bearer_status" \
+		"bearer.status.interface"
+}
+
+###############################################################################
+# Actual Internet connectivity check
+###############################################################################
+
+internet_ok() {
+	local iface="$1"
+	local target
+
+	[ -n "$iface" ] || return 1
+
+	ip link show dev "$iface" \
+		>/dev/null 2>&1 ||
+		return 1
+
+	for target in $PING_TARGETS; do
+
+		if ping \
+			-I "$iface" \
+			-c 1 \
+			-W "$PING_TIMEOUT" \
+			"$target" \
+			>/dev/null 2>&1; then
+			return 0
+		fi
+
+	done
+
+	return 1
+}
+
+###############################################################################
+# Wait for ModemManager
+###############################################################################
+
+wait_for_modemmanager() {
+	local count=0
+
+	while [ "$count" -lt 40 ]; do
+
+		if mmcli \
+			--timeout 5 \
+			-L \
+			>/dev/null 2>&1 &&
+			mmcli \
+				--timeout 5 \
+				-m any \
+				-K \
+				>/dev/null 2>&1; then
+			return 0
+		fi
+
+		count=$((count + 1))
+
+		sleep 1
+	done
+
+	return 1
+}
+
+###############################################################################
+# Diagnostic collectors
+###############################################################################
+
+collect_modem_summary() {
+	mmcli \
+		--timeout 10 \
+		-m any \
+		-K \
+		2>&1 |
+		grep -E \
+			'generic.state|generic.signal-quality|generic.access-technologies|generic.bearers|3gpp.registration-state|3gpp.operator-name|3gpp.operator-code|3gpp.packet-service-state' |
+		truncate_output
+}
+
+collect_bearer_summary() {
+	local bearer="$1"
+
+	[ -n "$bearer" ] || return
+
+	mmcli \
+		--timeout 10 \
+		-b "$bearer" \
+		-K \
+		2>&1 |
+		truncate_output
+}
+
+collect_recent_modem_logs() {
+	logread \
+		2>/dev/null |
+		grep -E \
+			'ModemManager|modemmanager|modem-watchdog|netifd|qmi|QMI|cdc-wdm|wwan' |
+		tail -n "$MODEM_LOG_LINES" |
+		truncate_output
+}
+
+collect_recent_kernel_logs() {
+	dmesg \
+		2>/dev/null |
+		grep -E \
+			'qmi|QMI|cdc-wdm|wwan|usb|USB|option|ttyUSB' |
+		tail -n "$KERNEL_LOG_LINES" |
+		truncate_output
+}
+
+###############################################################################
+# Send diagnostic event to local server
+###############################################################################
+
+# report_event() {
+# 	local severity="$1"
+# 	local event="$2"
+# 	local reason="$3"
+# 	local action="$4"
+
+# 	local modem_status=""
+# 	local state="unknown"
+# 	local registration="unknown"
+# 	local signal="unknown"
+# 	local access_tech="unknown"
+# 	local packet_service="unknown"
+
+# 	local bearer_path=""
+# 	local bearer_status=""
+# 	local bearer_iface=""
+# 	local bearer_connected="unknown"
+
+# 	local internet="false"
+
+# 	local hostname
+# 	local timestamp
+# 	local uptime_seconds
+# 	local incident_age=0
+
+# 	local ifstatus_data
+# 	local addr_data
+# 	local route_data
+# 	local rule_data
+
+# 	local modem_summary
+# 	local bearer_summary
+# 	local modem_logs
+# 	local kernel_logs
+
+# 	[ "$API_ENABLED" -eq 1 ] ||
+# 		return 0
+
+# 	#######################################################################
+# 	# Current ModemManager state
+# 	#######################################################################
+
+# 	modem_status="$(get_modem_status)"
+
+# 	if [ -n "$modem_status" ]; then
+
+# 		state="$(
+# 			modemmanager_get_field \
+# 				"$modem_status" \
+# 				"modem.generic.state"
+# 		)"
+
+# 		registration="$(
+# 			modemmanager_get_field \
+# 				"$modem_status" \
+# 				"modem.3gpp.registration-state"
+# 		)"
+
+# 		signal="$(
+# 			modemmanager_get_field \
+# 				"$modem_status" \
+# 				"modem.generic.signal-quality.value"
+# 		)"
+
+# 		access_tech="$(
+# 			modemmanager_get_field \
+# 				"$modem_status" \
+# 				"modem.generic.access-technologies"
+# 		)"
+
+# 		packet_service="$(
+# 			modemmanager_get_field \
+# 				"$modem_status" \
+# 				"modem.3gpp.packet-service-state"
+# 		)"
+
+# 		bearer_path="$(
+# 			get_bearer_path \
+# 				"$modem_status"
+# 		)"
+
+# 	fi
+
+# 	[ -n "$state" ] ||
+# 		state="unknown"
+
+# 	[ -n "$registration" ] ||
+# 		registration="unknown"
+
+# 	[ -n "$signal" ] ||
+# 		signal="unknown"
+
+# 	[ -n "$access_tech" ] ||
+# 		access_tech="unknown"
+
+# 	[ -n "$packet_service" ] ||
+# 		packet_service="unknown"
+
+# 	#######################################################################
+# 	# Bearer state
+# 	#######################################################################
+
+# 	if [ -n "$bearer_path" ]; then
+
+# 		bearer_status="$(
+# 			get_bearer_status \
+# 				"$bearer_path"
+# 		)"
+
+# 		if [ -n "$bearer_status" ]; then
+
+# 			bearer_iface="$(
+# 				get_bearer_iface \
+# 					"$bearer_status"
+# 			)"
+
+# 			bearer_connected="$(
+# 				modemmanager_get_field \
+# 					"$bearer_status" \
+# 					"bearer.status.connected"
+# 			)"
+
+# 		fi
+
+# 	fi
+
+# 	[ -n "$bearer_connected" ] ||
+# 		bearer_connected="unknown"
+
+# 	#######################################################################
+# 	# Internet test
+# 	#######################################################################
+
+# 	if [ -n "$bearer_iface" ] &&
+# 		internet_ok "$bearer_iface"; then
+# 		internet="true"
+# 	fi
+
+# 	#######################################################################
+# 	# General information
+# 	#######################################################################
+
+# 	hostname="$(
+# 		uci -q get system.@system[0].hostname
+# 	)"
+
+# 	[ -n "$hostname" ] ||
+# 		hostname="$(hostname)"
+
+# 	timestamp="$(
+# 		date -u '+%Y-%m-%dT%H:%M:%SZ'
+# 	)"
+
+# 	uptime_seconds="$(
+# 		cut -d. -f1 /proc/uptime \
+# 			2>/dev/null
+# 	)"
+
+# 	[ -n "$uptime_seconds" ] ||
+# 		uptime_seconds="unknown"
+
+# 	if [ "$incident_started" -gt 0 ]; then
+
+# 		incident_age=$(
+# 			$(now) - incident_started
+# 		)
+
+# 	fi
+
+# 	#######################################################################
+# 	# Linux / netifd diagnostics
+# 	#######################################################################
+
+# 	ifstatus_data="$(
+# 		ifstatus "$NETIF" \
+# 			2>&1 |
+# 			truncate_output
+# 	)"
+
+# 	if [ -n "$bearer_iface" ]; then
+
+# 		addr_data="$(
+# 			ip addr show \
+# 				dev "$bearer_iface" \
+# 				2>&1 |
+# 				truncate_output
+# 		)"
+
+# 	else
+
+# 		addr_data="bearer interface unavailable"
+
+# 	fi
+
+# 	route_data="$(
+# 		ip route show \
+# 			2>&1 |
+# 			truncate_output
+# 	)"
+
+# 	rule_data="$(
+# 		ip rule show \
+# 			2>&1 |
+# 			truncate_output
+# 	)"
+
+# 	#######################################################################
+# 	# Modem / kernel logs
+# 	#######################################################################
+
+# 	modem_summary="$(
+# 		collect_modem_summary
+# 	)"
+
+# 	bearer_summary="$(
+# 		collect_bearer_summary \
+# 			"$bearer_path"
+# 	)"
+
+# 	modem_logs="$(
+# 		collect_recent_modem_logs
+# 	)"
+
+# 	kernel_logs="$(
+# 		collect_recent_kernel_logs
+# 	)"
+
+# 	#######################################################################
+# 	# Build JSON
+# 	#######################################################################
+
+# 	json_init
+
+# 	json_add_string \
+# 		"name" \
+# 		"$API_NAME"
+
+# 	json_add_object \
+# 		"content"
+
+# 	json_add_string \
+# 		"timestamp" \
+# 		"$timestamp"
+
+# 	json_add_string \
+# 		"hostname" \
+# 		"$hostname"
+
+# 	json_add_string \
+# 		"uptime_seconds" \
+# 		"$uptime_seconds"
+
+# 	json_add_string \
+# 		"severity" \
+# 		"$severity"
+
+# 	json_add_string \
+# 		"event" \
+# 		"$event"
+
+# 	json_add_string \
+# 		"reason" \
+# 		"$reason"
+
+# 	json_add_string \
+# 		"action" \
+# 		"$action"
+
+# 	json_add_string \
+# 		"incident_id" \
+# 		"${incident_id:-none}"
+
+# 	json_add_string \
+# 		"incident_age_seconds" \
+# 		"$incident_age"
+
+# 	json_add_string \
+# 		"recovery_level" \
+# 		"$recovery_level"
+
+# 	json_add_string \
+# 		"mm_state" \
+# 		"$state"
+
+# 	json_add_string \
+# 		"registration" \
+# 		"$registration"
+
+# 	json_add_string \
+# 		"signal_quality" \
+# 		"$signal"
+
+# 	json_add_string \
+# 		"access_tech" \
+# 		"$access_tech"
+
+# 	json_add_string \
+# 		"packet_service" \
+# 		"$packet_service"
+
+# 	json_add_string \
+# 		"bearer_path" \
+# 		"${bearer_path:-none}"
+
+# 	json_add_string \
+# 		"bearer_interface" \
+# 		"${bearer_iface:-none}"
+
+# 	json_add_string \
+# 		"bearer_connected" \
+# 		"$bearer_connected"
+
+# 	json_add_string \
+# 		"internet_reachable" \
+# 		"$internet"
+
+# 	json_add_string \
+# 		"ifstatus" \
+# 		"$ifstatus_data"
+
+# 	json_add_string \
+# 		"ip_addr" \
+# 		"$addr_data"
+
+# 	json_add_string \
+# 		"ip_route" \
+# 		"$route_data"
+
+# 	json_add_string \
+# 		"ip_rule" \
+# 		"$rule_data"
+
+# 	json_add_string \
+# 		"modem_summary" \
+# 		"$modem_summary"
+
+# 	json_add_string \
+# 		"bearer_summary" \
+# 		"$bearer_summary"
+
+# 	json_add_string \
+# 		"recent_modem_logs" \
+# 		"$modem_logs"
+
+# 	json_add_string \
+# 		"recent_kernel_logs" \
+# 		"$kernel_logs"
+
+# 	json_close_object
+
+# 	json_add_string \
+# 		"type" \
+# 		"$API_TYPE"
+
+# 	#######################################################################
+# 	# Send directly to local server.
+# 	#
+# 	# IMPORTANT:
+# 	#
+# 	# Do not call log_error() when this fails.
+# 	# Otherwise:
+# 	#
+# 	#     API failure
+# 	#       -> log_error()
+# 	#       -> report_event()
+# 	#       -> API failure
+# 	#       -> recursion
+# 	#
+# 	#######################################################################
+
+# 	if ! json_dump |
+# 		curl \
+# 			--silent \
+# 			--show-error \
+# 			--fail \
+# 			--connect-timeout "$API_CONNECT_TIMEOUT" \
+# 			--max-time "$API_MAX_TIME" \
+# 			--header 'Content-Type: application/json' \
+# 			--data-binary @- \
+# 			--output /dev/null \
+# 			"$API_URL"; then
+
+# 		logger \
+# 			-p daemon.warning \
+# 			-t "$TAG" \
+# 			"failed to send diagnostic event=$event to local API"
+
+# 		return 1
+
+# 	fi
+
+# 	return 0
+# }
+
+report_event() {
+	local severity="$1"
+	local event="$2"
+	local reason="$3"
+	local action="$4"
+
+	local modem_status=""
+	local state="unknown"
+	local registration="unknown"
+	local signal="unknown"
+	local access_tech="unknown"
+	local packet_service="unknown"
+
+	local bearer_path=""
+	local bearer_status=""
+	local bearer_iface=""
+	local bearer_connected="unknown"
+
+	local internet="false"
+
+	local hostname
+	local timestamp
+	local uptime_seconds
+	local incident_age=0
+
+	local ifstatus_data
+	local addr_data
+	local route_data
+	local rule_data
+
+	local modem_summary
+	local bearer_summary
+	local modem_logs
+	local kernel_logs
+
+	local json_file
+
+	[ "$API_ENABLED" -eq 1 ] ||
+		return 0
+
+	#######################################################################
+	# Current ModemManager state
+	#######################################################################
+
+	modem_status="$(get_modem_status)"
+
+	if [ -n "$modem_status" ]; then
+
+		state="$(
+			modemmanager_get_field \
+				"$modem_status" \
+				"modem.generic.state"
+		)"
+
+		registration="$(
+			modemmanager_get_field \
+				"$modem_status" \
+				"modem.3gpp.registration-state"
+		)"
+
+		signal="$(
+			modemmanager_get_field \
+				"$modem_status" \
+				"modem.generic.signal-quality.value"
+		)"
+
+		access_tech="$(
+			modemmanager_get_field \
+				"$modem_status" \
+				"modem.generic.access-technologies"
+		)"
+
+		packet_service="$(
+			modemmanager_get_field \
+				"$modem_status" \
+				"modem.3gpp.packet-service-state"
+		)"
+
+		bearer_path="$(
+			get_bearer_path \
+				"$modem_status"
+		)"
+
+	fi
+
+	[ -n "$state" ] ||
+		state="unknown"
+
+	[ -n "$registration" ] ||
+		registration="unknown"
+
+	[ -n "$signal" ] ||
+		signal="unknown"
+
+	[ -n "$access_tech" ] ||
+		access_tech="unknown"
+
+	[ -n "$packet_service" ] ||
+		packet_service="unknown"
+
+	#######################################################################
+	# Bearer state
+	#######################################################################
+
+	if [ -n "$bearer_path" ]; then
+
+		bearer_status="$(
+			get_bearer_status \
+				"$bearer_path"
+		)"
+
+		if [ -n "$bearer_status" ]; then
+
+			bearer_iface="$(
+				get_bearer_iface \
+					"$bearer_status"
+			)"
+
+			bearer_connected="$(
+				modemmanager_get_field \
+					"$bearer_status" \
+					"bearer.status.connected"
+			)"
+
+		fi
+
+	fi
+
+	[ -n "$bearer_connected" ] ||
+		bearer_connected="unknown"
+
+	#######################################################################
+	# Internet test
+	#######################################################################
+
+	if [ -n "$bearer_iface" ] &&
+		internet_ok "$bearer_iface"; then
+		internet="true"
+	fi
+
+	#######################################################################
+	# General information
+	#######################################################################
+
+	hostname="$(
+		uci -q get system.@system[0].hostname
+	)"
+
+	[ -n "$hostname" ] ||
+		hostname="$(hostname)"
+
+	timestamp="$(
+		date -u '+%Y-%m-%dT%H:%M:%SZ'
+	)"
+
+	uptime_seconds="$(
+		cut -d. -f1 /proc/uptime \
+			2>/dev/null
+	)"
+
+	[ -n "$uptime_seconds" ] ||
+		uptime_seconds="unknown"
+
+	if [ "$incident_started" -gt 0 ]; then
+
+		incident_age=$((\
+			$(now) - incident_started))
+
+	fi
+
+	#######################################################################
+	# Linux / netifd diagnostics
+	#######################################################################
+
+	# ifstatus_data="$(
+	# 	ifstatus "$NETIF" \
+	# 		2>&1 |
+	# 		truncate_output
+	# )"
+
+	if [ -n "$bearer_iface" ]; then
+
+		addr_data="$(
+			ip addr show \
+				dev "$bearer_iface" \
+				2>&1 |
+				truncate_output
+		)"
+
+	else
+
+		addr_data="bearer interface unavailable"
+
+	fi
+
+	route_data="$(
+		ip route show \
+			2>&1 |
+			truncate_output
+	)"
+
+	rule_data="$(
+		ip rule show \
+			2>&1 |
+			truncate_output
+	)"
+
+	#######################################################################
+	# Modem / kernel logs
+	#######################################################################
+
+	# modem_summary="$(
+	# 	collect_modem_summary
+	# )"
+
+	# bearer_summary="$(
+	# 	collect_bearer_summary \
+	# 		"$bearer_path"
+	# )"
+
+	# modem_logs="$(
+	# 	collect_recent_modem_logs
+	# )"
+
+	# kernel_logs="$(
+	# 	collect_recent_kernel_logs
+	# )"
+
+	#######################################################################
+	# Build JSON
+	#######################################################################
+
+	json_init
+
+	json_add_string \
+		"name" \
+		"$API_NAME"
+
+	json_add_object \
+		"content"
+
+	json_add_string \
+		"deviceDate" \
+		"$timestamp"
+
+	json_add_string \
+		"hostname" \
+		"$hostname"
+
+	json_add_string \
+		"uptimeSeconds" \
+		"$uptime_seconds"
+
+	json_add_string \
+		"severity" \
+		"$severity"
+
+	json_add_string \
+		"event" \
+		"$event"
+
+	json_add_string \
+		"reason" \
+		"$reason"
+
+	json_add_string \
+		"action" \
+		"$action"
+
+	json_add_string \
+		"incidentId" \
+		"${incident_id:-none}"
+
+	json_add_string \
+		"incident_age_seconds" \
+		"$incident_age"
+
+	json_add_string \
+		"recoveryLevel" \
+		"$recovery_level"
+
+	json_add_string \
+		"mmState" \
+		"$state"
+
+	json_add_string \
+		"registration" \
+		"$registration"
+
+	json_add_string \
+		"signal_quality" \
+		"$signal"
+
+	json_add_string \
+		"accessTech" \
+		"$access_tech"
+
+	json_add_string \
+		"packetService" \
+		"$packet_service"
+
+	json_add_string \
+		"bearer_path" \
+		"${bearer_path:-none}"
+
+	json_add_string \
+		"bearerInterface" \
+		"${bearer_iface:-none}"
+
+	json_add_string \
+		"bearerconnected" \
+		"$bearer_connected"
+
+	json_add_string \
+		"internetReachable" \
+		"$internet"
+
+	# json_add_string \
+	# 	"ifstatus" \
+	# 	"$ifstatus_data"
+
+	# json_add_string \
+	# 	"ip_addr" \
+	# 	"$addr_data"
+
+	# json_add_string \
+	# 	"ip_route" \
+	# 	"$route_data"
+
+	# json_add_string \
+	# 	"ip_rule" \
+	# 	"$rule_data"
+
+	# json_add_string \
+	# 	"modem_summary" \
+	# 	"$modem_summary"
+
+	# json_add_string \
+	# 	"bearer_summary" \
+	# 	"$bearer_summary"
+
+	# json_add_string \
+	# 	"recent_modem_logs" \
+	# 	"$modem_logs"
+
+	# json_add_string \
+	# 	"recent_kernel_logs" \
+	# 	"$kernel_logs"
+
+	json_close_object
+
+	json_add_string \
+		"type" \
+		"$API_TYPE"
+
+	#######################################################################
+	# Write temporary JSON file.
+	#
+	# This is NOT a queue. The file only exists for the duration
+	# of this HTTP request because OpenWrt uclient-fetch wget's
+	# --post-file option expects a real file.
+	#######################################################################
+
+	json_file="/tmp/mm-watchdog-api-$$.json"
+
+	if ! json_dump >"$json_file"; then
+
+		logger \
+			-p daemon.warning \
+			-t "$TAG" \
+			"failed to create diagnostic JSON event=$event"
+
+		rm -f "$json_file"
+
+		return 1
+
+	fi
+
+	###############################################################################
+	# Send diagnostic JSON to local API.
+	#
+	# OpenWrt uclient-fetch incorrectly considers some valid 2xx responses,
+	# including HTTP 201 Created, to be errors.
+	#
+	# Therefore:
+	#
+	#   exit 0                     -> success
+	#   exit 8 + "HTTP error 2xx" -> also success
+	#   everything else           -> failure
+	###############################################################################
+
+	local wget_output
+	local wget_rc
+
+	wget_output="$(
+		/bin/uclient-fetch \
+			-4 \
+			--no-proxy \
+			-O /dev/null \
+			--timeout="$API_TIMEOUT" \
+			--header='Content-Type: application/json' \
+			--post-file="$json_file" \
+			"$API_URL" \
+			2>&1
+	)"
+
+	wget_rc=$?
+
+	#
+	# Normal uclient-fetch success.
+	#
+	if [ "$wget_rc" -eq 0 ]; then
+
+		rm -f "$json_file"
+
+		return 0
+
+	fi
+
+	#
+	# uclient-fetch treats some valid HTTP 2xx statuses as errors.
+	#
+	# Examples:
+	#
+	#   HTTP error 201
+	#   HTTP error 202
+	#   HTTP error 205
+	#
+	# All HTTP 2xx responses are considered successful by this API client.
+	#
+	if [ "$wget_rc" -eq 8 ] &&
+		printf '%s\n' "$wget_output" |
+		grep -Eq 'HTTP error 2[0-9][0-9]([^0-9]|$)'; then
+
+		rm -f "$json_file"
+
+		return 0
+
+	fi
+
+	#
+	# Real failure.
+	#
+	logger \
+		-p daemon.warning \
+		-t "$TAG" \
+		"failed to send diagnostic event=$event rc=$wget_rc response='$wget_output'"
+
+	rm -f "$json_file"
+
+	return 1
+
+}
+
+###############################################################################
+# Error logger
+#
+# Errors go both to logread and the local API.
+###############################################################################
+
+log_error() {
+	local message="$*"
+
+	logger \
+		-p daemon.err \
+		-t "$TAG" \
+		"$message"
+
+	if [ "$REPORT_ERRORS" -eq 1 ]; then
+
+		report_event \
+			"error" \
+			"watchdog-error" \
+			"$message" \
+			"none"
+
+	fi
+}
+
+###############################################################################
+# Recovery logger
+###############################################################################
+
+log_recovery() {
+	local event="$1"
+	local reason="$2"
+	local action="$3"
+
+	logger \
+		-p daemon.warning \
+		-t "$TAG" \
+		"event=$event recovery=$action reason=$reason level=$recovery_level incident=${incident_id:-none}"
+
+	if [ "$REPORT_RECOVERY" -eq 1 ]; then
+
+		report_event \
+			"warning" \
+			"$event" \
+			"$reason" \
+			"$action"
+
+	fi
+}
+
+###############################################################################
+# Recovery level 1
+#
+# Recreate the bearer through netifd.
+#
+# IMPORTANT:
+#
+# The OpenWrt modemmanager interface should have:
+#
+#       option disable_modem '0'
+#
+# Otherwise ifdown may also disable the radio.
+###############################################################################
+
+soft_reconnect() {
+	local reason="$1"
+
+	ensure_incident
+
+	log_recovery \
+		"$reason" \
+		"$reason" \
+		"soft-reconnect"
+
+	ifdown "$NETIF" \
+		>/dev/null 2>&1
+
+	sleep 2
+
+	if ! ifup "$NETIF" \
+		>/dev/null 2>&1; then
+
+		log_error \
+			"ifup failed during soft reconnect reason=$reason"
+
+		return 1
+
+	fi
+
+	return 0
+}
+
+###############################################################################
+# Recovery level 2
+###############################################################################
+
+restart_modemmanager() {
+	local reason="$1"
+
+	ensure_incident
+
+	log_recovery \
+		"$reason" \
+		"$reason" \
+		"restart-modemmanager"
+
+	ifdown "$NETIF" \
+		>/dev/null 2>&1
+
+	if ! /etc/init.d/modemmanager restart \
+		>/dev/null 2>&1; then
+
+		log_error \
+			"failed to restart ModemManager reason=$reason"
+
+		return 1
+
+	fi
+
+	if ! wait_for_modemmanager; then
+
+		log_error \
+			"ModemManager unavailable after restart reason=$reason"
+
+		return 1
+
+	fi
+
+	log \
+		"ModemManager available again"
+
+	if ! ifup "$NETIF" \
+		>/dev/null 2>&1; then
+
+		log_error \
+			"ifup failed after ModemManager restart reason=$reason"
+
+		return 1
+
+	fi
+
+	return 0
+}
+
+###############################################################################
+# Recovery level 3
+###############################################################################
+
+radio_cycle() {
+	local reason="$1"
+
+	ensure_incident
+
+	log_recovery \
+		"$reason" \
+		"$reason" \
+		"radio-cycle"
+
+	ifdown "$NETIF" \
+		>/dev/null 2>&1
+
+	#
+	# Ignore simple-disconnect failure because there may
+	# already be no active bearer.
+	#
+	mmcli \
+		--timeout 20 \
+		-m any \
+		--simple-disconnect \
+		>/dev/null 2>&1
+
+	if ! mmcli \
+		--timeout 30 \
+		-m any \
+		--disable \
+		>/dev/null 2>&1; then
+
+		log_warning \
+			"modem disable failed during radio cycle reason=$reason"
+
+	fi
+
+	sleep 3
+
+	if ! mmcli \
+		--timeout 60 \
+		-m any \
+		--enable \
+		>/dev/null 2>&1; then
+
+		log_error \
+			"failed to enable modem after radio cycle reason=$reason"
+
+		return 1
+
+	fi
+
+	log \
+		"radio enabled again"
+
+	sleep 3
+
+	if ! ifup "$NETIF" \
+		>/dev/null 2>&1; then
+
+		log_error \
+			"ifup failed after radio cycle reason=$reason"
+
+		return 1
+
+	fi
+
+	return 0
+}
+
+###############################################################################
+# Recovery level 4
+###############################################################################
+
+reset_modem() {
+	local reason="$1"
+
+	ensure_incident
+
+	log_recovery \
+		"$reason" \
+		"$reason" \
+		"modem-reset"
+
+	ifdown "$NETIF" \
+		>/dev/null 2>&1
+
+	if ! mmcli \
+		--timeout 30 \
+		-m any \
+		--reset \
+		>/dev/null 2>&1; then
+
+		log_error \
+			"mmcli modem reset command failed reason=$reason"
+
+	fi
+
+	#
+	# The ModemManager modem object may disappear and return
+	# using a different modem index.
+	#
+	sleep 10
+
+	if ! wait_for_modemmanager; then
+
+		log_error \
+			"modem did not reappear after modem reset"
+
+		if ! /etc/init.d/modemmanager restart \
+			>/dev/null 2>&1; then
+
+			log_error \
+				"failed to restart ModemManager after modem reset"
+
+			return 1
+
+		fi
+
+		if ! wait_for_modemmanager; then
+
+			log_error \
+				"modem unavailable even after ModemManager restart"
+
+			return 1
+
+		fi
+
+	fi
+
+	if ! ifup "$NETIF" \
+		>/dev/null 2>&1; then
+
+		log_error \
+			"ifup failed after modem reset reason=$reason"
+
+		return 1
+
+	fi
+
+	return 0
+}
+
+###############################################################################
+# Escalating recovery state machine
+###############################################################################
+
+recover_connection() {
+	local reason="$1"
+	local current
+
+	ensure_incident
+
+	case "$recovery_level" in
+
+	0)
+
+		soft_reconnect \
+			"$reason"
+
+		recovery_level=1
+
+		;;
+
+	1)
+
+		restart_modemmanager \
+			"$reason"
+
+		last_mm_restart="$(now)"
+
+		recovery_level=2
+
+		;;
+
+	2)
+
+		radio_cycle \
+			"$reason"
+
+		recovery_level=3
+
+		;;
+
+	*)
+
+		current="$(now)"
+
+		if [ $((current - last_modem_reset)) \
+			-ge "$MODEM_RESET_COOLDOWN" ]; then
+
+			reset_modem \
+				"$reason"
+
+			last_modem_reset="$current"
+
+			recovery_level=4
+
+		else
+
+			remaining=$((\
+				MODEM_RESET_COOLDOWN - (\
+				current - last_modem_reset)))
+
+			log_warning \
+				"modem reset suppressed by cooldown reason=$reason remaining=${remaining}s"
+
+		fi
+
+		;;
+
+	esac
+
+	bad_count=0
+
+	sleep "$ACTION_GRACE"
+}
+
+###############################################################################
+# Configuration sanity checks
+###############################################################################
+
+check_openwrt_config() {
+	local force_connection
+	local disable_modem
+
+	force_connection="$(
+		uci -q get \
+			network.${NETIF}.force_connection
+	)"
+
+	disable_modem="$(
+		uci -q get \
+			network.${NETIF}.disable_modem
+	)"
+
+	if [ "$force_connection" != "1" ]; then
+
+		log_warning \
+			"network.$NETIF.force_connection is not 1"
+
+	fi
+
+	if [ "$disable_modem" != "0" ]; then
+
+		log_warning \
+			"network.$NETIF.disable_modem is not 0; soft reconnect may disable the modem radio"
+
+	fi
+}
+
+###############################################################################
+# Startup
+###############################################################################
+
+check_openwrt_config
+
+log \
+	"started interface=$NETIF api=$API_URL"
+
+if [ "$REPORT_STARTUP" -eq 1 ]; then
+
+	report_event \
+		"info" \
+		"watchdog-started" \
+		"service-started" \
+		"none"
+
+fi
+
+###############################################################################
+# Main watchdog loop
+###############################################################################
+
+while :; do
+
+	current="$(now)"
+
+	modem_status="$(
+		get_modem_status
+	)"
+
+	#######################################################################
+	# ModemManager completely unavailable
+	#######################################################################
+
+	if [ -z "$modem_status" ]; then
+
+		mm_failure_count=$((\
+			mm_failure_count + 1))
+
+		log \
+			"mmcli unavailable count=$mm_failure_count"
+
+		if [ "$mm_failure_count" -ge 3 ]; then
+
+			ensure_incident
+
+			if [ $((current - last_mm_restart)) \
+				-ge "$MM_RESTART_COOLDOWN" ]; then
+
+				restart_modemmanager \
+					"modemmanager-unresponsive"
+
+				last_mm_restart="$current"
+
+				set_recovery_level_min 2
+
+				sleep "$ACTION_GRACE"
+
+			else
+
+				remaining=$((\
+					MM_RESTART_COOLDOWN - (\
+					current - last_mm_restart)))
+
+				log_warning \
+					"ModemManager restart suppressed by cooldown remaining=${remaining}s"
+
+			fi
+
+			mm_failure_count=0
+
+		fi
+
+		sleep "$CHECK_INTERVAL"
+
+		continue
+
+	fi
+
+	mm_failure_count=0
+
+	#######################################################################
+	# Extract state
+	#######################################################################
+
+	state="$(
+		modemmanager_get_field \
+			"$modem_status" \
+			"modem.generic.state"
+	)"
+
+	registration="$(
+		modemmanager_get_field \
+			"$modem_status" \
+			"modem.3gpp.registration-state"
+	)"
+
+	signal="$(
+		modemmanager_get_field \
+			"$modem_status" \
+			"modem.generic.signal-quality.value"
+	)"
+
+	[ -n "$state" ] ||
+		state="unknown"
+
+	[ -n "$registration" ] ||
+		registration="unknown"
+
+	[ -n "$signal" ] ||
+		signal="unknown"
+
+	#######################################################################
+	# Detect modem state transition
+	#######################################################################
+
+	if [ "$state" != "$last_state" ]; then
+
+		log \
+			"state ${last_state:-none} -> $state registration=$registration signal=$signal recovery_level=$recovery_level"
+
+		last_state="$state"
+
+		state_since="$current"
+
+		bad_count=0
+
+	fi
+
+	state_age=$((\
+		current - state_since))
+
+	#######################################################################
+	# State machine
+	#######################################################################
+
+	case "$state" in
+
+	################################################################
+	# Modem claims data connection exists.
+	################################################################
+
+	connected)
+
+		bearer_path="$(
+			get_bearer_path \
+				"$modem_status"
+		)"
+
+		bearer_status="$(
+			get_bearer_status \
+				"$bearer_path"
+		)"
+
+		bearer_iface="$(
+			get_bearer_iface \
+				"$bearer_status"
+		)"
+
+		if internet_ok "$bearer_iface"; then
+			log \
+				"Internet is Connected iface=${bearer_iface:-none} recovery_level=$recovery_level"
+			################################################
+			# Connection successfully recovered.
+			################################################
+			if [ "$bad_count" -gt 0 ] ||
+				[ "$recovery_level" -gt 0 ] ||
+				[ -n "$incident_id" ]; then
+
+				log \
+					"Internet recovered iface=${bearer_iface:-none} incident=${incident_id:-none} recovery_level=$recovery_level"
+
+				report_event \
+					"info" \
+					"internet-recovered" \
+					"connectivity-restored" \
+					"none"
+
+			fi
+
+			#
+			# This is the ONLY normal place where
+			# recovery escalation is cleared.
+			#
+			bad_count=0
+
+			recovery_level=0
+
+			clear_incident
+
+		else
+
+			bad_count=$((\
+				bad_count + 1))
+
+			log \
+				"connected but Internet unavailable count=$bad_count iface=${bearer_iface:-none}"
+
+			if [ "$bad_count" \
+				-ge "$CONNECTED_FAIL_LIMIT" ]; then
+
+				ensure_incident
+
+				recover_connection \
+					"connected-no-internet"
+
+			fi
+
+		fi
+
+		;;
+
+	################################################################
+	# Cellular registration exists, but no data connection.
+	################################################################
+
+	registered)
+
+		bad_count=$((\
+			bad_count + 1))
+
+		log \
+			"registered without data count=$bad_count registration=$registration"
+
+		if [ "$bad_count" \
+			-ge "$REGISTERED_FAIL_LIMIT" ]; then
+
+			ensure_incident
+
+			recover_connection \
+				"registered-without-data"
+
+		fi
+
+		;;
+
+	################################################################
+	# Searching is expected when train enters poor coverage.
+	################################################################
+
+	searching)
+
+		bad_count=0
+
+		if [ "$state_age" \
+			-ge "$SEARCHING_RECOVERY_AFTER" ]; then
+
+			if [ $((current - last_search_recovery)) \
+				-ge "$SEARCHING_RECOVERY_COOLDOWN" ]; then
+
+				ensure_incident
+
+				log_recovery \
+					"searching-too-long" \
+					"searching-${state_age}-seconds" \
+					"radio-cycle"
+
+				radio_cycle \
+					"searching-too-long"
+
+				last_search_recovery="$current"
+
+				set_recovery_level_min 3
+
+				state_since="$(now)"
+
+				sleep "$ACTION_GRACE"
+
+			fi
+
+		fi
+
+		;;
+
+	################################################################
+	# Radio is enabled but registration hasn't started/progressed.
+	################################################################
+
+	enabled)
+
+		bad_count=0
+
+		if [ "$state_age" \
+			-ge "$ENABLED_STATE_TIMEOUT" ]; then
+
+			ensure_incident
+
+			radio_cycle \
+				"enabled-but-not-registering"
+
+			set_recovery_level_min 3
+
+			state_since="$(now)"
+
+			sleep "$ACTION_GRACE"
+
+		fi
+
+		;;
+
+	################################################################
+	# Modem unexpectedly disabled.
+	################################################################
+
+	disabled)
+
+		ensure_incident
+
+		log_recovery \
+			"modem-disabled" \
+			"modem-unexpectedly-disabled" \
+			"enable-modem"
+
+		if ! mmcli \
+			--timeout 60 \
+			-m any \
+			--enable \
+			>/dev/null 2>&1; then
+
+			log_error \
+				"failed to enable unexpectedly disabled modem"
+
+		else
+
+			if ! ifup "$NETIF" \
+				>/dev/null 2>&1; then
+
+				log_error \
+					"ifup failed after enabling modem"
+
+			fi
+
+		fi
+
+		sleep "$ACTION_GRACE"
+
+		;;
+
+	################################################################
+	# Temporary states.
+	################################################################
+
+	connecting | enabling | initializing | disconnecting | disabling)
+
+		bad_count=0
+
+		if [ "$state_age" \
+			-ge "$TEMP_STATE_TIMEOUT" ]; then
+
+			ensure_incident
+
+			restart_modemmanager \
+				"state-stuck-$state"
+
+			last_mm_restart="$(now)"
+
+			set_recovery_level_min 2
+
+			state_since="$(now)"
+
+			sleep "$ACTION_GRACE"
+
+		fi
+
+		;;
+
+	################################################################
+	# Never experiment automatically with SIM PIN/PUK.
+	################################################################
+
+	locked)
+
+		bad_count=0
+
+		log_warning \
+			"modem locked; automatic recovery suppressed"
+
+		sleep 30
+
+		;;
+
+	################################################################
+	# ModemManager reports failed state.
+	################################################################
+
+	failed)
+
+		reason="$(
+			modemmanager_get_field \
+				"$modem_status" \
+				"modem.generic.state-failed-reason"
+		)"
+
+		[ -n "$reason" ] ||
+			reason="unknown"
+
+		ensure_incident
+
+		case "$reason" in
+
+		sim-missing | sim-error | sim-wrong)
+
+			report_event \
+				"error" \
+				"modem-failed" \
+				"$reason" \
+				"automatic-reset-suppressed"
+
+			log_warning \
+				"modem failed reason=$reason; automatic reset suppressed"
+
+			sleep 30
+
+			;;
+
+		*)
+
+			recover_connection \
+				"modem-failed-$reason"
+
+			;;
+
+		esac
+
+		;;
+
+	################################################################
+	# Unexpected ModemManager state.
+	################################################################
+
+	*)
+
+		bad_count=0
+
+		log_warning \
+			"unhandled modem state='$state'"
+
+		sleep 10
+
+		;;
+
+	esac
+
+	sleep "$CHECK_INTERVAL"
+
+done

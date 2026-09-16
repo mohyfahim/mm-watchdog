@@ -1,0 +1,37 @@
+config mm_watchdog 'main'
+        option enabled '1'
+
+        option interface 'LTE'
+
+        option api_enabled '1'
+        option api_url 'your.api.url'
+        option api_name 'system'
+        option api_type 'mm-watch-dog'
+
+        option api_timeout '5'        
+        option check_interval '5'
+
+        option connected_fail_limit '3'
+        option registered_fail_limit '3'
+
+        option searching_recovery_after '180'
+        option searching_recovery_cooldown '600'
+
+        option modem_reset_cooldown '600'
+        option mm_restart_cooldown '120'
+
+        option temporary_state_timeout '120'
+        option enabled_state_timeout '60'
+
+        option action_grace '20'
+
+        option ping_timeout '2'
+        option ping_targets '8.8.8.8 1.1.1.1'
+
+        option report_recovery '1'
+        option report_errors '1'
+        option report_startup '1'
+        
+        option max_diag_bytes '8000'
+        option modem_log_lines '60'
+        option kernel_log_lines '40'
