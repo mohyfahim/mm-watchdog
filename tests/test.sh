@@ -111,13 +111,17 @@ logger() {
 }
 
 test_default_configuration() {
-	unset MOCK_interface MOCK_modem MOCK_check_interval MOCK_webhook_enabled MOCK_PING_TARGETS
+	unset MOCK_interface MOCK_modem MOCK_check_interval MOCK_hardware_reset_gpio \
+		MOCK_webhook_enabled MOCK_PING_TARGETS
 	load_watchdog_config
 	assert_equal wwan "$NETWORK_INTERFACE" interface
 	assert_equal auto "$MODEM" modem
 	assert_equal /sys/devices/mock-modem "$MODEM_SELECTOR" selector
 	assert_equal "1.1.1.1 8.8.8.8" "$PING_TARGETS" targets
+	assert_equal "" "$HARDWARE_RESET_GPIO" hardware-reset-gpio
 	assert_equal 0 "$WEBHOOK_ENABLED" webhook
+	assert_file_contains "$ROOT_DIR/files/etc/config/mm-watchdog" \
+		"option hardware_reset_gpio '515'"
 }
 
 test_explicit_modem_and_targets() {
@@ -134,6 +138,17 @@ test_invalid_numeric_configuration() {
 	MOCK_check_interval=zero
 	if load_watchdog_config 2>/dev/null; then
 		fail "invalid interval was accepted"
+	fi
+}
+
+test_hardware_reset_gpio_configuration() {
+	MOCK_hardware_reset_gpio=23
+	load_watchdog_config
+	assert_equal 23 "$HARDWARE_RESET_GPIO" hardware-reset-gpio
+
+	MOCK_hardware_reset_gpio=invalid
+	if load_watchdog_config 2>/dev/null; then
+		fail "invalid hardware reset GPIO was accepted"
 	fi
 }
 
@@ -220,6 +235,131 @@ test_failed_action_still_escalates() {
 	fi
 	assert_equal 1 "$RECOVERY_LEVEL" level
 	assert_equal 0 "$BAD_COUNT" bad-count
+}
+
+test_mmcli_reset_uses_hardware_fallback() {
+	local actions="$TEST_TMP/hardware-fallback-actions"
+	local gpio_file="$TEST_TMP/gpio-value"
+	: >"$actions"
+	: >"$gpio_file"
+	LAST_MODEM_RESET=0
+	MODEM_RESET_COOLDOWN=600
+	HARDWARE_RESET_GPIO=515
+	NETWORK_INTERFACE=wwan
+	MODEM_SELECTOR=0
+	RECOVERY_LEVEL=3
+	ensure_incident() { :; }
+	watchdog_now() { printf '1000\n'; }
+	watchdog_recovery() { printf 'recovery:%s\n' "$3" >>"$actions"; }
+	watchdog_error() { printf 'error:%s\n' "$*" >>"$actions"; }
+	ifdown() { printf 'ifdown\n' >>"$actions"; }
+	mmcli() { printf 'mmcli\n' >>"$actions"; return 1; }
+	hardware_reset_gpio_path() { printf '%s\n' "$gpio_file"; }
+	write_hardware_reset_gpio() { printf 'gpio:%s\n' "$2" >>"$actions"; }
+	sleep() { printf 'sleep:%s\n' "$1" >>"$actions"; }
+	wait_for_selected_modem() { printf 'wait\n' >>"$actions"; }
+	ifup() { printf 'ifup\n' >>"$actions"; }
+
+	reset_modem test
+	assert_equal \
+		"recovery:modem-reset ifdown mmcli error:mmcli modem reset failed reason=test recovery:hardware-reset gpio:1 sleep:2 gpio:0 sleep:10 wait ifup" \
+		"$(tr '\n' ' ' <"$actions" | sed 's/ $//')" actions
+}
+
+test_successful_mmcli_reset_skips_hardware() {
+	local hardware_calls="$TEST_TMP/unexpected-hardware-calls"
+	: >"$hardware_calls"
+	LAST_MODEM_RESET=0
+	MODEM_RESET_COOLDOWN=600
+	HARDWARE_RESET_GPIO=515
+	NETWORK_INTERFACE=wwan
+	MODEM_SELECTOR=0
+	RECOVERY_LEVEL=3
+	ensure_incident() { :; }
+	watchdog_now() { printf '1000\n'; }
+	watchdog_recovery() { :; }
+	ifdown() { :; }
+	mmcli() { return 0; }
+	hardware_reset_modem() { printf 'hardware-reset\n' >>"$hardware_calls"; return 1; }
+	sleep() { :; }
+	wait_for_selected_modem() { :; }
+	ifup() { :; }
+
+	reset_modem test
+	[ ! -s "$hardware_calls" ] || fail "hardware reset ran after a successful mmcli reset"
+}
+
+test_unavailable_hardware_reset_is_skipped() {
+	local actions="$TEST_TMP/unavailable-hardware-actions"
+	local gpio_file="$TEST_TMP/unwritable-gpio"
+	: >"$actions"
+	HARDWARE_RESET_GPIO=""
+	watchdog_error() { printf '%s\n' "$*" >>"$actions"; }
+	write_hardware_reset_gpio() { printf 'write\n' >>"$actions"; }
+
+	if hardware_reset_modem test; then
+		fail "unconfigured hardware reset reported success"
+	fi
+	assert_file_contains "$actions" "hardware_reset_gpio is not configured"
+	if grep -Fq write "$actions"; then
+		fail "unconfigured hardware reset attempted a GPIO write"
+	fi
+
+	: >"$actions"
+	HARDWARE_RESET_GPIO=515
+	hardware_reset_gpio_path() { printf '%s\n' "$TEST_TMP/missing-gpio"; }
+	if hardware_reset_modem test; then
+		fail "missing hardware reset GPIO reported success"
+	fi
+	assert_file_contains "$actions" "does not exist"
+	if grep -Fq write "$actions"; then
+		fail "missing hardware reset GPIO attempted a write"
+	fi
+
+	: >"$actions"
+	: >"$gpio_file"
+	hardware_reset_gpio_path() { printf '%s\n' "$gpio_file"; }
+	hardware_reset_gpio_is_writable() { return 1; }
+	if hardware_reset_modem test; then
+		fail "unwritable hardware reset GPIO reported success"
+	fi
+	assert_file_contains "$actions" "is not writable"
+	if grep -Fq write "$actions"; then
+		fail "unwritable hardware reset GPIO attempted a write"
+	fi
+}
+
+test_hardware_reset_write_failures() {
+	local actions="$TEST_TMP/hardware-write-failure-actions"
+	local gpio_file="$TEST_TMP/failing-gpio-value"
+	local fail_value=1
+	: >"$actions"
+	: >"$gpio_file"
+	HARDWARE_RESET_GPIO=515
+	hardware_reset_gpio_path() { printf '%s\n' "$gpio_file"; }
+	watchdog_recovery() { :; }
+	watchdog_error() { printf 'error:%s\n' "$*" >>"$actions"; }
+	write_hardware_reset_gpio() {
+		printf 'gpio:%s\n' "$2" >>"$actions"
+		[ "$2" != "$fail_value" ]
+	}
+	sleep() { printf 'sleep:%s\n' "$1" >>"$actions"; }
+
+	if hardware_reset_modem test; then
+		fail "failed GPIO assertion reported success"
+	fi
+	assert_equal \
+		"gpio:1 error:failed to assert hardware modem reset reason=test gpio_path=$gpio_file" \
+		"$(tr '\n' ' ' <"$actions" | sed 's/ $//')" assertion-actions
+
+	: >"$actions"
+	fail_value=0
+	if hardware_reset_modem test; then
+		fail "failed GPIO release reported success"
+	fi
+	assert_equal \
+		"gpio:1 sleep:2 gpio:0 error:failed to release hardware modem reset reason=test gpio_path=$gpio_file" \
+		"$(tr '\n' ' ' <"$actions" | sed 's/ $//')" release-actions
 }
 
 test_cooldown_calculation() {
@@ -483,11 +623,16 @@ test_init_disabled_service_is_removed() {
 run_test "default configuration and automatic modem selection" test_default_configuration
 run_test "explicit modem and repeatable ping targets" test_explicit_modem_and_targets
 run_test "invalid numeric configuration is rejected" test_invalid_numeric_configuration
+run_test "hardware reset GPIO configuration is optional and validated" test_hardware_reset_gpio_configuration
 run_test "invalid webhook URL is rejected" test_invalid_webhook_url
 run_test "connected bearer is selected from multiple bearers" test_connected_bearer_selection
 run_test "IPv4 failure falls back to an IPv6 target" test_ipv4_ipv6_target_fallback
 run_test "recovery actions follow the escalation ladder" test_recovery_ladder
 run_test "a failed recovery action still advances escalation" test_failed_action_still_escalates
+run_test "failed mmcli reset uses the hardware GPIO fallback" test_mmcli_reset_uses_hardware_fallback
+run_test "successful mmcli reset skips the hardware fallback" test_successful_mmcli_reset_skips_hardware
+run_test "unavailable hardware reset GPIO is not written" test_unavailable_hardware_reset_is_skipped
+run_test "hardware reset GPIO write failures are reported" test_hardware_reset_write_failures
 run_test "cooldown calculations handle initial and expired values" test_cooldown_calculation
 run_test "registered state honors its failure threshold" test_registered_failure_threshold
 run_test "searching recovery observes its long cooldown" test_searching_recovery_and_cooldown

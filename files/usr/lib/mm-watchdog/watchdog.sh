@@ -295,6 +295,53 @@ radio_cycle() {
 	fi
 }
 
+hardware_reset_gpio_path() {
+	printf '/sys/class/gpio/gpio%s/value\n' "$HARDWARE_RESET_GPIO"
+}
+
+write_hardware_reset_gpio() {
+	local gpio_path="$1"
+	local value="$2"
+
+	printf '%s\n' "$value" >"$gpio_path"
+}
+
+hardware_reset_gpio_is_writable() {
+	[ -w "$1" ]
+}
+
+hardware_reset_modem() {
+	local reason="$1"
+	local gpio_path
+
+	if [ -z "$HARDWARE_RESET_GPIO" ]; then
+		watchdog_error "hardware modem reset unavailable reason=$reason hardware_reset_gpio is not configured"
+		return 1
+	fi
+
+	gpio_path="$(hardware_reset_gpio_path)"
+	if [ ! -e "$gpio_path" ]; then
+		watchdog_error "hardware modem reset unavailable reason=$reason gpio_path=$gpio_path does not exist"
+		return 1
+	fi
+	if ! hardware_reset_gpio_is_writable "$gpio_path"; then
+		watchdog_error "hardware modem reset unavailable reason=$reason gpio_path=$gpio_path is not writable"
+		return 1
+	fi
+
+	watchdog_recovery "$reason" "$reason" hardware-reset
+	if ! write_hardware_reset_gpio "$gpio_path" 1; then
+		watchdog_error "failed to assert hardware modem reset reason=$reason gpio_path=$gpio_path"
+		return 1
+	fi
+
+	sleep 2
+	if ! write_hardware_reset_gpio "$gpio_path" 0; then
+		watchdog_error "failed to release hardware modem reset reason=$reason gpio_path=$gpio_path"
+		return 1
+	fi
+}
+
 reset_modem() {
 	local reason="$1"
 	local current
@@ -314,7 +361,7 @@ reset_modem() {
 
 	if ! mmcli --timeout 30 --modem "$MODEM_SELECTOR" --reset >/dev/null 2>&1; then
 		watchdog_error "mmcli modem reset failed reason=$reason"
-		return 1
+		hardware_reset_modem "$reason" || return 1
 	fi
 
 	sleep 10

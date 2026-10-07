@@ -127,6 +127,10 @@ validate_watchdog_config() {
 		validate_integer "$(printf '%s' "$name" | tr 'A-Z_' 'a-z-')" "$value" 0 || return 1
 	done
 
+	if [ -n "$HARDWARE_RESET_GPIO" ]; then
+		validate_integer hardware-reset-gpio "$HARDWARE_RESET_GPIO" 0 || return 1
+	fi
+
 	for name in ENABLED WEBHOOK_ENABLED REPORT_STARTUP REPORT_RECOVERY REPORT_ERRORS; do
 		eval "value=\${$name}"
 		validate_boolean "$(printf '%s' "$name" | tr 'A-Z_' 'a-z-')" "$value" || return 1
@@ -172,6 +176,7 @@ load_watchdog_config() {
 	config_get MM_RESTART_COOLDOWN main mm_restart_cooldown 120
 	config_get RADIO_CYCLE_COOLDOWN main radio_cycle_cooldown 120
 	config_get MODEM_RESET_COOLDOWN main modem_reset_cooldown 600
+	config_get HARDWARE_RESET_GPIO main hardware_reset_gpio ""
 
 	PING_TARGETS=""
 	PING_TARGET_INVALID=0

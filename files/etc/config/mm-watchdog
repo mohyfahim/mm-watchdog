@@ -21,6 +21,7 @@ config mm_watchdog 'main'
 	option mm_restart_cooldown '120'
 	option radio_cycle_cooldown '120'
 	option modem_reset_cooldown '600'
+	option hardware_reset_gpio '515'
 
 	option webhook_enabled '0'
 	option webhook_url ''

@@ -12,7 +12,8 @@ recovery actions while applying cooldowns to protect the modem:
 1. Recreate the netifd connection with `ifdown` and `ifup`.
 2. Restart ModemManager.
 3. Disconnect and cycle the modem radio.
-4. Reset the modem.
+4. Reset the modem, falling back to an optional hardware GPIO pulse if the
+   ModemManager reset command fails.
 
 SIM lock and permanent SIM error states are never reset automatically.
 
@@ -100,6 +101,7 @@ starting point.
 | `mm_restart_cooldown` | `120` | Minimum seconds between ModemManager restarts. |
 | `radio_cycle_cooldown` | `120` | Minimum seconds between radio cycles or enable attempts. |
 | `modem_reset_cooldown` | `600` | Minimum seconds between modem resets. |
+| `hardware_reset_gpio` | `515` | GPIO number used as a hardware-reset fallback; empty or absent disables it. |
 | `webhook_enabled` | `0` | Queue and deliver event webhooks. |
 | `webhook_url` | empty | HTTP or HTTPS event endpoint. |
 | `webhook_timeout` | `5` | Maximum webhook request time. |
@@ -112,6 +114,13 @@ starting point.
 Every numeric value is validated at startup. Intervals, timeouts, limits, and
 queue size must be positive; cooldowns may be zero. Invalid configuration makes
 the daemon exit with an error instead of running an unsafe recovery loop.
+
+Hardware reset is attempted only when the ModemManager reset command fails.
+The configured GPIO must already be exported, configured as an output, and
+available at `/sys/class/gpio/gpio<number>/value`. The watchdog drives it high
+for two seconds and then low. Remove `hardware_reset_gpio` or set it to an empty
+value to disable this fallback. Configurations created before this option was
+introduced remain disabled until the option is explicitly added.
 
 Connectivity succeeds when any target answers through the bearer interface.
 IPv6 literals are sent through `ping6`; all other values use `ping`.
@@ -227,7 +236,8 @@ Before deployment, verify on the target modem and firmware:
 - bearer disconnection and netifd reconnection;
 - extended searching with the configured cooldown;
 - ModemManager restart and modem object reappearance;
-- radio disable/enable and modem reset recovery;
+- radio disable/enable, modem reset recovery, and the configured hardware-reset
+  GPIO fallback;
 - a locked, missing, or faulty SIM does not trigger destructive recovery;
 - queued webhooks flush after connectivity returns;
 - TERM stops the daemon without leaving partial queue files.
